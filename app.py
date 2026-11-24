@@ -1,11 +1,13 @@
 import streamlit as st
 from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing import image
 import numpy as np
 from PIL import Image
 import random
 import os
 import time
+
+from gradcam import explain, overlay_heatmap, fracture_probability
+from feedback import log_event, feedback_form, admin_panel
 
 # =========================================
 # PAGE CONFIG
@@ -43,6 +45,14 @@ DATASET_PATHS = {
     "not_fractured": "dataset/test/not_fractured",
 }
 
+CLASS_MAP = {"Fractured": "fractured", "Normal": "not_fractured"}
+LABELS    = {"fractured": "Fractured", "not_fractured": "Normal"}
+
+HEATMAP_NOTE = (
+    "Educational use only, not for diagnosis. The heatmap shows where the AI "
+    "looked, not a verified fracture location."
+)
+
 # =========================================
 # SESSION STATE INITIALISATION
 # =========================================
@@ -69,8 +79,8 @@ for key, val in DEFAULTS.items():
 # HELPERS
 # =========================================
 
-def pick_random_image(used: list) -> tuple[str, str]:
-    """Return (image_path, actual_class) avoiding recently used images."""
+def pick_random_image(used: list) -> tuple[str, str, str]:
+    """Return (image_path, actual_class, filename) avoiding recently used images."""
     actual_class = random.choice(["fractured", "not_fractured"])
     folder = DATASET_PATHS[actual_class]
 
@@ -89,7 +99,7 @@ def pick_random_image(used: list) -> tuple[str, str]:
 
     available = [img for img in all_images if img not in used]
     if not available:
-        available = all_images      
+        available = all_images
 
     chosen = random.choice(available)
     return os.path.join(folder, chosen), actual_class, chosen
@@ -127,6 +137,26 @@ def get_remaining_time(timer_seconds: int) -> float:
         return timer_seconds
     elapsed = time.time() - st.session_state.question_start_time
     return max(0.0, timer_seconds - elapsed)
+
+
+def record_answer(user_answer):
+    """Score the current question (user_answer is "Fractured"/"Normal", or None
+    on timeout) and log it. Returns True if correct."""
+    correct = user_answer is not None and CLASS_MAP[user_answer] == st.session_state.actual_class
+    seconds = round(time.time() - st.session_state.question_start_time, 1)
+
+    if correct:
+        st.session_state.score += 1
+
+    log_event(
+        "quiz_answer",
+        difficulty=st.session_state.difficulty,
+        question=st.session_state.question_number,
+        answered=user_answer is not None,
+        correct=correct,
+        seconds=seconds,
+    )
+    return correct
 
 # =========================================
 # CUSTOM CSS - NEUMORPHIC DARK & GOLD
@@ -346,12 +376,19 @@ if st.session_state.page == "home":
     with col1:
         if st.button("Doubt Solver", use_container_width=True):
             st.session_state.page = "doubt_solver"
+            log_event("page_view", page="doubt_solver")
             st.rerun()
 
     with col2:
         if st.button("Quiz Mode", use_container_width=True):
             st.session_state.page = "quiz_mode"
+            log_event("page_view", page="quiz_mode")
             st.rerun()
+
+    if st.button("Give Feedback", use_container_width=True):
+        st.session_state.page = "feedback"
+        log_event("page_view", page="feedback")
+        st.rerun()
 
     # --- FEATURE SECTION ---
     st.markdown("""
@@ -373,6 +410,22 @@ if st.session_state.page == "home":
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+# =========================================
+# FEEDBACK PAGE
+# =========================================
+
+elif st.session_state.page == "feedback":
+
+    st.markdown("<h2 class='quiz-heading'>Feedback</h2>", unsafe_allow_html=True)
+    st.write("")
+
+    if st.button("Return"):
+        st.session_state.page = "home"
+        st.rerun()
+
+    st.markdown("---")
+    feedback_form()
 
 # =========================================
 # DOUBT SOLVER
@@ -397,21 +450,50 @@ elif st.session_state.page == "doubt_solver":
     if uploaded_file is not None:
 
         img = Image.open(uploaded_file).convert("RGB")
-        st.image(img, use_container_width=True)
 
-        img_resized  = img.resize((128, 128))
-        img_array    = image.img_to_array(img_resized)
-        img_array    = np.expand_dims(img_array, axis=0) / 255.0
+        # One forward/backward pass gives both the prediction and the heat map.
+        # Cached per upload so the slider/toggle don't re-run the model.
+        upload_key = (uploaded_file.name, uploaded_file.size)
+        if st.session_state.get("ds_key") != upload_key:
+            prob, cam = explain(model, img)
+            st.session_state.ds_key  = upload_key
+            st.session_state.ds_prob = prob
+            st.session_state.ds_cam  = cam
+            log_event(
+                "upload_prediction",
+                p_fracture=round(fracture_probability(prob), 3),
+                label="normal" if prob > 0.5 else "abnormal",
+            )
+        prob = st.session_state.ds_prob
+        cam  = st.session_state.ds_cam
 
-        prediction   = model.predict(img_array)
-        confidence   = float(prediction[0][0])
+        show_heat = st.toggle("Show AI attention heatmap", value=True)
+
+        if show_heat:
+            strength = st.slider("Heatmap intensity", 0.3, 1.0, 0.8, 0.05)
+            heat_img = overlay_heatmap(img, cam, strength)
+            c1, c2 = st.columns(2)
+            c1.image(img, caption="Original", use_container_width=True)
+            c2.image(heat_img, caption="Regions that influenced the AI", use_container_width=True)
+        else:
+            st.image(img, use_container_width=True)
 
         st.markdown("---")
 
-        if confidence > 0.5:
+        confidence = max(prob, 1.0 - prob)
+        if prob > 0.5:
             st.markdown("<h3 style='color:#c49d6c;'>Result: Normal Structure</h3>", unsafe_allow_html=True)
         else:
             st.markdown("<h3 style='color:#c49d6c;'>Result: Abnormality Detected</h3>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='color:#7b7d82;'>AI confidence: {confidence:.0%}</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(HEATMAP_NOTE)
+
+    st.markdown("---")
+    with st.expander("Share feedback"):
+        feedback_form()
 
 # =========================================
 # QUIZ MODE
@@ -459,6 +541,7 @@ elif st.session_state.page == "quiz_mode":
             reset_quiz()
             st.session_state.quiz_started  = True
             st.session_state.difficulty    = difficulty
+            log_event("quiz_start", difficulty=difficulty)
             load_next_question()
             st.rerun()
 
@@ -474,12 +557,15 @@ elif st.session_state.page == "quiz_mode":
         # ---- Auto-advance on timeout ----
         if remaining <= 0 and not st.session_state.answer_submitted:
             st.session_state.answer_submitted = True       # No score added (timeout)
+            record_answer(None)                            # logged
 
             if st.session_state.question_number < total_questions:
                 st.session_state.question_number += 1
                 load_next_question()
             else:
                 st.session_state.quiz_finished = True
+                log_event("quiz_complete", difficulty=st.session_state.difficulty,
+                          score=st.session_state.score, total=total_questions)
 
             st.rerun()
 
@@ -568,14 +654,12 @@ elif st.session_state.page == "quiz_mode":
             if not st.session_state.answer_submitted:
                 st.session_state.answer_submitted = True
 
-                class_map = {"Fractured": "fractured", "Normal": "not_fractured"}
-                correct = (class_map[user_answer] == st.session_state.actual_class)
+                correct = record_answer(user_answer)
 
                 if correct:
-                    st.session_state.score += 1
                     st.toast("Result: Correct")
                 else:
-                    actual_label = "Fractured" if st.session_state.actual_class == "fractured" else "Normal"
+                    actual_label = LABELS[st.session_state.actual_class]
                     st.toast(f"Result: Incorrect. Expected: {actual_label}")
 
                 time.sleep(1.0)     # Brief pause so toast is visible
@@ -585,6 +669,8 @@ elif st.session_state.page == "quiz_mode":
                     load_next_question()
                 else:
                     st.session_state.quiz_finished = True
+                    log_event("quiz_complete", difficulty=st.session_state.difficulty,
+                              score=st.session_state.score, total=total_questions)
 
                 st.rerun()
 
@@ -621,6 +707,10 @@ elif st.session_state.page == "quiz_mode":
             unsafe_allow_html=True,
         )
 
+        st.markdown("---")
+        feedback_form()
+        st.markdown("---")
+
         col_restart, col_home = st.columns(2)
 
         with col_restart:
@@ -634,3 +724,6 @@ elif st.session_state.page == "quiz_mode":
                 reset_quiz()
                 st.session_state.page = "home"
                 st.rerun()
+
+# Team-only analytics: open the app with ?admin=1 (needs ADMIN_PASSWORD in secrets)
+admin_panel()
